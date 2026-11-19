@@ -169,6 +169,11 @@ impl Default for Config {
 }
 
 pub(crate) unsafe fn init(config: Config) {
+    // ST RM0456 § 10.5.4: in Range 1 these parts require HCLK steps of at most 80 MHz,
+    // with at least 5 µs at the intermediate frequency.
+    const LIMIT_HCLK_STEP: bool = cfg!(any(stm32u59x, stm32u5ax, stm32u5fx, stm32u5gx));
+    const SETTLE_CYCLES: u32 = 6 * 80; // 6 µs at 80 MHz, including 1 µs of margin.
+
     // Configure the clock to a safe default state before starting configuration:
 
     // 1 - Set power mode to Range1
@@ -179,20 +184,39 @@ pub(crate) unsafe fn init(config: Config) {
     FLASH.acr().modify(|w| {
         w.set_latency(4);
     });
+    // RM0456 § 7.3.3 requires a latency readback before increasing HCLK.
+    assert!(FLASH.acr().read().latency() == 4);
 
     // 3 - enable HSI
     // HSI is the preferred source for a safe clock setup since its value is fixed and it is available on all MCus
     RCC.cr().modify(|w| w.set_hsion(true));
     while !RCC.cr().read().hsirdy() {}
 
+    // A bootloader can leave PLL1 driving HCLK above 80 MHz with HPRE at /1 (0xxx).
+    if LIMIT_HCLK_STEP && RCC.cfgr1().read().sws() == Sysclk::PLL1_R && RCC.cfgr2().read().hpre() < AHBPrescaler::DIV2 {
+        RCC.cfgr2().modify(|w| w.set_hpre(AHBPrescaler::DIV2));
+        cortex_m::asm::delay(SETTLE_CYCLES);
+    }
+
     // 4 - set sysclock to HSI
     RCC.cfgr1().modify(|w| w.set_sw(Sysclk::HSI));
     while RCC.cfgr1().read().sws() != Sysclk::HSI {}
 
-    // 5 - set HPRE to div1 (not strictly necessary, but at this point it is a safe operation and there is no need to keep AHB prescalers)
-    RCC.cfgr2().modify(|w| {
-        w.set_hpre(AHBPrescaler::DIV1);
-    });
+    // PLL1MBOOST can only be written with the EPOD booster disabled.
+    PWR.vosr().modify(|w| w.set_boosten(false));
+
+    // Any PLL may still use MSIS. Stop them before changing its frequency.
+    pll_enable(PllInstance::Pll1, false);
+    pll_enable(PllInstance::Pll2, false);
+    pll_enable(PllInstance::Pll3, false);
+
+    // Set the intermediate divider before configuring PLL1.
+    let hsi_pre = if LIMIT_HCLK_STEP {
+        AHBPrescaler::DIV2
+    } else {
+        AHBPrescaler::DIV1
+    };
+    RCC.cfgr2().modify(|w| w.set_hpre(hsi_pre));
 
     // now configuration can proceed without issues:
 
@@ -362,27 +386,9 @@ pub(crate) unsafe fn init(config: Config) {
     let hsi48 = config.hsi48.map(super::init_hsi48);
 
     let pll_input = PllInput { hse, hsi, msi: msis };
-    let pll1 = config.pll1.map_or_else(
-        || {
-            pll_enable(PllInstance::Pll1, false);
-            PllOutput::default()
-        },
-        |c| init_pll(PllInstance::Pll1, Some(c), &pll_input, config.voltage_range),
-    );
-    let pll2 = config.pll2.map_or_else(
-        || {
-            pll_enable(PllInstance::Pll2, false);
-            PllOutput::default()
-        },
-        |c| init_pll(PllInstance::Pll2, Some(c), &pll_input, config.voltage_range),
-    );
-    let pll3 = config.pll3.map_or_else(
-        || {
-            pll_enable(PllInstance::Pll3, false);
-            PllOutput::default()
-        },
-        |c| init_pll(PllInstance::Pll3, Some(c), &pll_input, config.voltage_range),
-    );
+    let pll1 = init_pll(PllInstance::Pll1, config.pll1, &pll_input, config.voltage_range);
+    let pll2 = init_pll(PllInstance::Pll2, config.pll2, &pll_input, config.voltage_range);
+    let pll3 = init_pll(PllInstance::Pll3, config.pll3, &pll_input, config.voltage_range);
 
     // Verify that sysclk is valid before attempting to change the clock source
     // This ensures that, even in case of an error, the clock remains in a safe state
@@ -449,10 +455,14 @@ pub(crate) unsafe fn init(config: Config) {
     FLASH.acr().modify(|w| {
         w.set_latency(wait_states);
     });
+    assert!(FLASH.acr().read().latency() == wait_states);
 
     // Configure the bus prescalers
+    let step_up = LIMIT_HCLK_STEP && config.voltage_range == VoltageScale::RANGE1 && hclk > Hertz::mhz(80);
     RCC.cfgr2().modify(|w| {
-        w.set_hpre(config.ahb_pre);
+        if !step_up {
+            w.set_hpre(config.ahb_pre);
+        }
         w.set_ppre1(config.apb1_pre);
         w.set_ppre2(config.apb2_pre);
     });
@@ -464,6 +474,12 @@ pub(crate) unsafe fn init(config: Config) {
     // now that flash WS, VOS and HPRE are configured, the system can switch the clock source
     RCC.cfgr1().modify(|w| w.set_sw(config.sys));
     while RCC.cfgr1().read().sws() != config.sys {}
+
+    if step_up {
+        // Start the settling delay only once PLL1 is driving HCLK through /2.
+        cortex_m::asm::delay(SETTLE_CYCLES);
+        RCC.cfgr2().modify(|w| w.set_hpre(config.ahb_pre));
+    }
 
     let (pclk1, pclk1_tim) = super::util::calc_pclk(hclk, config.apb1_pre);
     let (pclk2, pclk2_tim) = super::util::calc_pclk(hclk, config.apb2_pre);
@@ -599,9 +615,6 @@ fn pll_enable(instance: PllInstance, enabled: bool) {
 }
 
 fn init_pll(instance: PllInstance, config: Option<Pll>, input: &PllInput, voltage_range: VoltageScale) -> PllOutput {
-    // Disable PLL
-    pll_enable(instance, false);
-
     let Some(pll) = config else { return PllOutput::default() };
 
     let src_freq = match pll.source {
